@@ -1,0 +1,17 @@
+# Throwaway DEMO stack with synthetic data. Layered on top of docker-compose.prod.yml:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.demo.yml --env-file .env.docker up -d --build
+#
+# It runs as a separate Compose project ("edumanage-demo") with its own database volume,
+# so it can never seed into the production stack's database. The migrate service applies
+# migrations and then seeds the fictional demo accounts (every account's password is
+# SEED_DEMO_PASSWORD). Remove everything with the same command and `down -v`.
+name: edumanage-demo
+
+services:
+  migrate:
+    command: ["sh", "-c", "npx prisma migrate deploy && npm run db:seed"]
+    environment:
+      # The seed refuses NODE_ENV=production; this database exists only for the demo.
+      NODE_ENV: development
+      SEED_DEMO_PASSWORD: ${SEED_DEMO_PASSWORD:?Set SEED_DEMO_PASSWORD in .env.docker for the demo stack}

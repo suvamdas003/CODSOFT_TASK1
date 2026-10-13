@@ -1,0 +1,67 @@
+# Full stack in Docker: PostgreSQL + migrations + the EduManage app.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.docker up -d --build
+#
+# Configure values in .env.docker (copy from .env.docker.example). Use a letters-and-
+# digits POSTGRES_PASSWORD so it can be embedded in the connection URL unchanged.
+#
+# This stack never contains demo data: the migrate service runs with NODE_ENV=production,
+# so the demo seed refuses to run. For a throwaway demo stack see docker-compose.demo.yml.
+name: edumanage
+
+x-database-url: &database-url "postgresql://edumanage:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.docker}@db:5432/edumanage?schema=public"
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: edumanage
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.docker}
+      POSTGRES_DB: edumanage
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edumanage -d edumanage"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Not published to the host: only the app and migrator can reach the database.
+
+  migrate:
+    build:
+      context: .
+      target: migrator
+    image: edumanage-migrator:latest
+    environment:
+      DATABASE_URL: *database-url
+      NODE_ENV: production
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      target: runner
+    image: edumanage-app:latest
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: *database-url
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in .env.docker}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      BETTER_AUTH_TRUSTED_ORIGINS: ${BETTER_AUTH_TRUSTED_ORIGINS:-}
+      BETTER_AUTH_TRUSTED_PROXIES: ${BETTER_AUTH_TRUSTED_PROXIES:-}
+      AUTH_SIGNIN_RATE_LIMIT_MAX: ${AUTH_SIGNIN_RATE_LIMIT_MAX:-5}
+      AUTH_SIGNIN_ACCOUNT_LIMIT_MAX: ${AUTH_SIGNIN_ACCOUNT_LIMIT_MAX:-10}
+      # The school's time zone decides what "today" is (attendance, payment and due dates).
+      TZ: ${TZ:-UTC}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  db-data:

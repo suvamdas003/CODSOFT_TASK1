@@ -1,0 +1,38 @@
+# Optional local PostgreSQL for DEVELOPMENT (use it if you do not run PostgreSQL yourself).
+#
+#   docker compose up -d
+#
+# Creates the databases `edumanage` and `edumanage_test` (owner `edumanage`) and publishes
+# them on 127.0.0.1:5433 only — port 5433 so it never collides with a locally installed
+# PostgreSQL on 5432. Matching .env values (already the defaults in .env.example):
+#   DATABASE_URL="postgresql://edumanage:edumanage_dev@localhost:5433/edumanage?schema=public"
+#   TEST_DATABASE_URL="postgresql://edumanage:edumanage_dev@localhost:5433/edumanage_test?schema=public"
+# Use another host port with POSTGRES_PORT (e.g. in .env) and change both URLs to match.
+#
+# `edumanage_dev` is a throwaway development password, reachable from this computer only.
+# Never use this file for production — see docker-compose.prod.yml.
+name: edumanage-dev
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: edumanage
+      POSTGRES_PASSWORD: edumanage_dev
+      POSTGRES_DB: edumanage
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - edumanage-pgdata:/var/lib/postgresql/data
+      - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edumanage -d edumanage"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  edumanage-pgdata:
+    # Fixed name: keeps the data volume created by earlier versions of this file.
+    name: edumanage_edumanage-pgdata

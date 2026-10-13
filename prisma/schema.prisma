@@ -1,0 +1,571 @@
+// EduManage database schema (PostgreSQL, Prisma ORM 7).
+// Conventions:
+//   * Monetary amounts are stored as integers in minor units (e.g. cents) — never floats.
+//   * Calendar dates (attendance day, due dates, ...) use @db.Date; instants use timestamptz.
+//   * Core academic and financial records use onDelete: Restrict so history cannot be lost
+//     by accident; records are deactivated instead of deleted.
+//   * Additional CHECK constraints live in the SQL migrations (see docs/DATABASE.md).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum Role {
+  ADMIN
+  TEACHER
+  STUDENT
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  UNDISCLOSED
+}
+
+enum StudentStatus {
+  ACTIVE
+  INACTIVE
+  GRADUATED
+  TRANSFERRED
+}
+
+enum TeacherStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  EXCUSED
+}
+
+enum ExamStatus {
+  DRAFT
+  PUBLISHED
+}
+
+enum FeeFrequency {
+  ONE_TIME
+  MONTHLY
+  QUARTERLY
+  TERM
+  ANNUAL
+}
+
+enum InvoiceStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  CHEQUE
+  CARD_TERMINAL
+  OTHER
+}
+
+/// Where a payment record came from. Only MANUAL exists: every payment is recorded by
+/// staff after money was received outside the system. Add a gateway value only together
+/// with a real, verified payment-provider integration.
+enum PaymentSource {
+  MANUAL
+}
+
+// ──────────────────── Authentication (Better Auth) ────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  role          Role      @default(STUDENT)
+  isActive      Boolean   @default(true)
+  lastLoginAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  sessions           Session[]
+  accounts           Account[]
+  studentProfile     StudentProfile?
+  teacherProfile     TeacherProfile?
+  auditEvents        AuditLog[]
+  attendanceRecorded AttendanceRecord[]
+  marksEntered       Mark[]
+  invoicesCreated    Invoice[]
+  paymentsRecorded   Payment[]
+
+  @@index([role])
+  @@map("users")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  expiresAt DateTime
+  token     String   @unique
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model Account {
+  id                    String    @id @default(cuid())
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  /// Password hash (scrypt) for the "credential" provider. Never selected outside auth code.
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verifications")
+}
+
+/// Rate-limit counters written by Better Auth (database storage).
+model RateLimit {
+  id          String @id @default(cuid())
+  key         String @unique
+  count       Int
+  lastRequest BigInt
+
+  @@map("rate_limits")
+}
+
+// ───────────────────────────── Configuration ─────────────────────────────
+
+/// Single-row table (id = 1) with institution-wide, configurable policies.
+model InstitutionSettings {
+  id                       Int      @id @default(1)
+  name                     String   @default("EduManage School")
+  address                  String?
+  phone                    String?
+  email                    String?
+  /// ISO 4217 code. Can only be changed while no invoices exist.
+  currencyCode             String   @default("USD") @db.VarChar(3)
+  locale                   String   @default("en-US")
+  /// Whether LATE counts as attended when calculating attendance percentage.
+  lateCountsAsPresent      Boolean  @default(true)
+  /// Whether EXCUSED days are removed from the denominator (otherwise counted as absent).
+  excusedExcludedFromTotal Boolean  @default(true)
+  /// Attendance percentage below which a student is flagged.
+  lowAttendanceThreshold   Int      @default(75)
+  invoicePrefix            String   @default("INV")
+  receiptPrefix            String   @default("RCT")
+  updatedAt                DateTime @updatedAt
+
+  @@map("institution_settings")
+}
+
+/// Atomic counters used for human-readable invoice / receipt numbers.
+model Counter {
+  key   String @id
+  value Int    @default(0)
+
+  @@map("counters")
+}
+
+model GradeScale {
+  id          String      @id @default(cuid())
+  name        String      @unique
+  description String?
+  isDefault   Boolean     @default(false)
+  bands       GradeBand[]
+  exams       Exam[]
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@map("grade_scales")
+}
+
+/// A grade applies when percentage >= minPercent and is below the next band's minPercent.
+model GradeBand {
+  id         String     @id @default(cuid())
+  scaleId    String
+  scale      GradeScale @relation(fields: [scaleId], references: [id], onDelete: Cascade)
+  label      String
+  minPercent Decimal    @db.Decimal(5, 2)
+  gradePoint Decimal?   @db.Decimal(4, 2)
+  remark     String?
+  isPassing  Boolean    @default(true)
+
+  @@unique([scaleId, label])
+  @@unique([scaleId, minPercent])
+  @@map("grade_bands")
+}
+
+// ───────────────────────────── Academics ─────────────────────────────
+
+model AcademicSession {
+  id            String         @id @default(cuid())
+  name          String         @unique
+  startDate     DateTime       @db.Date
+  endDate       DateTime       @db.Date
+  /// Exactly one session should be current; enforced transactionally by the service layer.
+  isCurrent     Boolean        @default(false)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  sections      Section[]
+  exams         Exam[]
+  feeStructures FeeStructure[]
+  invoices      Invoice[]
+
+  @@index([isCurrent])
+  @@map("academic_sessions")
+}
+
+model SchoolClass {
+  id            String         @id @default(cuid())
+  name          String         @unique
+  /// Ordering key (e.g. 1 for Grade 1).
+  level         Int            @unique
+  description   String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  sections      Section[]
+  exams         Exam[]
+  feeStructures FeeStructure[]
+
+  @@map("classes")
+}
+
+model Section {
+  id                String               @id @default(cuid())
+  name              String
+  classId           String
+  class             SchoolClass          @relation(fields: [classId], references: [id], onDelete: Restrict)
+  academicSessionId String
+  academicSession   AcademicSession      @relation(fields: [academicSessionId], references: [id], onDelete: Restrict)
+  classTeacherId    String?
+  classTeacher      TeacherProfile?      @relation("ClassTeacher", fields: [classTeacherId], references: [id], onDelete: SetNull)
+  capacity          Int?
+  room              String?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+  students          StudentProfile[]
+  assignments       TeachingAssignment[]
+  attendance        AttendanceRecord[]
+
+  @@unique([classId, academicSessionId, name])
+  @@index([academicSessionId])
+  @@index([classTeacherId])
+  @@map("sections")
+}
+
+model Subject {
+  id           String               @id @default(cuid())
+  code         String               @unique
+  name         String
+  description  String?
+  isActive     Boolean              @default(true)
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+  assignments  TeachingAssignment[]
+  examSubjects ExamSubject[]
+
+  @@map("subjects")
+}
+
+/// A teacher teaches one subject to one section. One teacher per (section, subject).
+model TeachingAssignment {
+  id        String         @id @default(cuid())
+  teacherId String
+  teacher   TeacherProfile @relation(fields: [teacherId], references: [id], onDelete: Restrict)
+  sectionId String
+  section   Section        @relation(fields: [sectionId], references: [id], onDelete: Restrict)
+  subjectId String
+  subject   Subject        @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  createdAt DateTime       @default(now())
+
+  @@unique([sectionId, subjectId])
+  @@index([teacherId])
+  @@map("teaching_assignments")
+}
+
+// ───────────────────────────── People ─────────────────────────────
+
+model StudentProfile {
+  id               String             @id @default(cuid())
+  userId           String             @unique
+  user             User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  admissionNumber  String             @unique
+  firstName        String
+  lastName         String
+  dateOfBirth      DateTime?          @db.Date
+  gender           Gender             @default(UNDISCLOSED)
+  phone            String?
+  address          String?
+  guardianName     String
+  guardianRelation String
+  guardianPhone    String
+  guardianEmail    String?
+  sectionId        String?
+  section          Section?           @relation(fields: [sectionId], references: [id], onDelete: Restrict)
+  enrollmentDate   DateTime           @db.Date
+  status           StudentStatus      @default(ACTIVE)
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  attendance       AttendanceRecord[]
+  marks            Mark[]
+  invoices         Invoice[]
+
+  @@index([sectionId])
+  @@index([status])
+  @@index([lastName, firstName])
+  @@map("students")
+}
+
+model TeacherProfile {
+  id             String               @id @default(cuid())
+  userId         String               @unique
+  user           User                 @relation(fields: [userId], references: [id], onDelete: Restrict)
+  employeeId     String               @unique
+  firstName      String
+  lastName       String
+  phone          String?
+  qualification  String?
+  specialization String?
+  joiningDate    DateTime             @db.Date
+  status         TeacherStatus        @default(ACTIVE)
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+  assignments    TeachingAssignment[]
+  classSections  Section[]            @relation("ClassTeacher")
+
+  @@index([status])
+  @@index([lastName, firstName])
+  @@map("teachers")
+}
+
+// ───────────────────────────── Attendance ─────────────────────────────
+
+model AttendanceRecord {
+  id           String           @id @default(cuid())
+  studentId    String
+  student      StudentProfile   @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  sectionId    String
+  section      Section          @relation(fields: [sectionId], references: [id], onDelete: Restrict)
+  date         DateTime         @db.Date
+  status       AttendanceStatus
+  remarks      String?
+  recordedById String?
+  recordedBy   User?            @relation(fields: [recordedById], references: [id], onDelete: SetNull)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  /// One entry per student per section per day.
+  @@unique([studentId, sectionId, date])
+  @@index([sectionId, date])
+  @@index([studentId, date])
+  @@map("attendance_records")
+}
+
+// ───────────────────────────── Examinations ─────────────────────────────
+
+/// An examination for every section of one class within one academic session.
+model Exam {
+  id                String          @id @default(cuid())
+  name              String
+  academicSessionId String
+  academicSession   AcademicSession @relation(fields: [academicSessionId], references: [id], onDelete: Restrict)
+  classId           String
+  class             SchoolClass     @relation(fields: [classId], references: [id], onDelete: Restrict)
+  gradeScaleId      String
+  gradeScale        GradeScale      @relation(fields: [gradeScaleId], references: [id], onDelete: Restrict)
+  startDate         DateTime?       @db.Date
+  endDate           DateTime?       @db.Date
+  /// Students can only see results of PUBLISHED exams; marks are locked once published.
+  status            ExamStatus      @default(DRAFT)
+  publishedAt       DateTime?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  subjects          ExamSubject[]
+
+  @@unique([academicSessionId, classId, name])
+  @@index([classId])
+  @@map("exams")
+}
+
+model ExamSubject {
+  id        String    @id @default(cuid())
+  examId    String
+  exam      Exam      @relation(fields: [examId], references: [id], onDelete: Restrict)
+  subjectId String
+  subject   Subject   @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  maxMarks  Int
+  passMarks Int
+  examDate  DateTime? @db.Date
+  marks     Mark[]
+
+  @@unique([examId, subjectId])
+  @@map("exam_subjects")
+}
+
+model Mark {
+  id            String         @id @default(cuid())
+  examSubjectId String
+  examSubject   ExamSubject    @relation(fields: [examSubjectId], references: [id], onDelete: Restrict)
+  studentId     String
+  student       StudentProfile @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  /// NULL when the student was absent.
+  marksObtained Decimal?       @db.Decimal(6, 2)
+  isAbsent      Boolean        @default(false)
+  remarks       String?
+  enteredById   String?
+  enteredBy     User?          @relation(fields: [enteredById], references: [id], onDelete: SetNull)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@unique([examSubjectId, studentId])
+  @@index([studentId])
+  @@map("marks")
+}
+
+// ───────────────────────────── Fees ─────────────────────────────
+
+model FeeStructure {
+  id                String          @id @default(cuid())
+  name              String
+  academicSessionId String
+  academicSession   AcademicSession @relation(fields: [academicSessionId], references: [id], onDelete: Restrict)
+  /// NULL = applies to every class.
+  classId           String?
+  class             SchoolClass?    @relation(fields: [classId], references: [id], onDelete: Restrict)
+  amountMinor       Int
+  frequency         FeeFrequency
+  description       String?
+  isActive          Boolean         @default(true)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  invoiceItems      InvoiceItem[]
+
+  @@index([academicSessionId, classId])
+  @@map("fee_structures")
+}
+
+model Invoice {
+  id                String          @id @default(cuid())
+  invoiceNumber     String          @unique
+  studentId         String
+  student           StudentProfile  @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  academicSessionId String
+  academicSession   AcademicSession @relation(fields: [academicSessionId], references: [id], onDelete: Restrict)
+  issueDate         DateTime        @db.Date
+  dueDate           DateTime        @db.Date
+  /// Sum of item amounts (minor units). Kept consistent inside the creating transaction.
+  totalMinor        Int
+  /// Sum of payments (minor units). Updated only inside the payment transaction.
+  paidMinor         Int             @default(0)
+  status            InvoiceStatus   @default(UNPAID)
+  notes             String?
+  createdById       String?
+  createdBy         User?           @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  cancelledAt       DateTime?
+  cancelReason      String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  items             InvoiceItem[]
+  payments          Payment[]
+
+  @@index([studentId])
+  @@index([status, dueDate])
+  @@index([academicSessionId])
+  @@map("invoices")
+}
+
+model InvoiceItem {
+  id             String        @id @default(cuid())
+  invoiceId      String
+  invoice        Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  feeStructureId String?
+  feeStructure   FeeStructure? @relation(fields: [feeStructureId], references: [id], onDelete: Restrict)
+  description    String
+  /// Billing period (e.g. "October 2026"); prevents billing the same fee twice per period.
+  periodLabel    String        @default("")
+  amountMinor    Int
+
+  @@index([invoiceId])
+  @@index([feeStructureId, periodLabel])
+  @@map("invoice_items")
+}
+
+model Payment {
+  id             String        @id @default(cuid())
+  receiptNumber  String        @unique
+  invoiceId      String
+  invoice        Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  amountMinor    Int
+  method         PaymentMethod
+  source         PaymentSource @default(MANUAL)
+  reference      String?
+  notes          String?
+  paidAt         DateTime
+  recordedById   String?
+  recordedBy     User?         @relation(fields: [recordedById], references: [id], onDelete: SetNull)
+  /// Client-generated key that makes a double-submitted payment form a no-op.
+  idempotencyKey String        @unique
+  createdAt      DateTime      @default(now())
+
+  @@index([invoiceId])
+  @@index([paidAt])
+  @@map("payments")
+}
+
+// ───────────────────────────── Audit ─────────────────────────────
+
+/// Append-only log of important changes. Never stores passwords, hashes or secrets.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action     String
+  entityType String
+  entityId   String?
+  summary    String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@map("audit_logs")
+}
